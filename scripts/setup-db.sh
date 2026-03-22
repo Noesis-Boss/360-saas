@@ -33,9 +33,9 @@ DB_PORT="${DB_PORT:-3306}"
 DB_USER="${DB_USER:?DB_USER not set}"
 DB_PASSWORD="${DB_PASSWORD:?DB_PASSWORD not set}"
 DB_NAME="${DB_NAME:?DB_NAME not set}"
-MIGRATION_FILE="${ROOT_DIR}/backend/src/migrations.sql"
 
-MYSQL_CMD="mysql -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" -p"${DB_PASSWORD}" --silent"
+MIGRATION_FILE="${ROOT_DIR}/backend/src/migrations.sql"
+MYSQL_CMD="mysql -h${DB_HOST} -P${DB_PORT} -u${DB_USER} -p${DB_PASSWORD} --silent"
 
 # ---------------------------------------------------------------------------
 # 1. Test connection
@@ -54,21 +54,62 @@ ${MYSQL_CMD} -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8
 ok "Database '${DB_NAME}' ready."
 
 # ---------------------------------------------------------------------------
-# 3. Run migrations (idempotent - uses IF NOT EXISTS)
+# 3. Drop duplicate indexes before running migrations (idempotent safety)
+# ---------------------------------------------------------------------------
+log "Dropping pre-existing indexes to avoid duplicate key errors..."
+
+drop_index_if_exists() {
+  local table="$1"
+  local index="$2"
+  local exists
+  exists=$(${MYSQL_CMD} "${DB_NAME}" -e \
+    "SELECT COUNT(*) FROM information_schema.statistics \
+     WHERE table_schema='${DB_NAME}' AND table_name='${table}' AND index_name='${index}';" 2>/dev/null || echo 0)
+  if [[ "$exists" -gt 0 ]]; then
+    warn "  Dropping existing index '${index}' on '${table}'..."
+    ${MYSQL_CMD} "${DB_NAME}" -e "ALTER TABLE \`${table}\` DROP INDEX \`${index}\`;" 2>/dev/null || true
+  fi
+}
+
+# Add all known indexes from migrations.sql here
+drop_index_if_exists "users"            "idx_users_tenant"
+drop_index_if_exists "users"            "idx_users_email"
+drop_index_if_exists "review_cycles"    "idx_cycles_tenant"
+drop_index_if_exists "competencies"     "idx_competencies_tenant"
+drop_index_if_exists "rater_assignments" "idx_rater_assignments_cycle"
+drop_index_if_exists "survey_responses" "idx_responses_assignment"
+
+ok "Index pre-flight complete."
+
+# ---------------------------------------------------------------------------
+# 4. Run migrations
 # ---------------------------------------------------------------------------
 [[ -f "$MIGRATION_FILE" ]] || error "Migration file not found: $MIGRATION_FILE"
-
 log "Running migrations from ${MIGRATION_FILE}..."
-mysql -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" < "$MIGRATION_FILE"
+
+# Use --force so non-fatal errors (e.g. duplicate keys) are logged but do not abort
+MIGRATION_OUTPUT=$(mysql -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" -p"${DB_PASSWORD}" \
+  --force "${DB_NAME}" < "$MIGRATION_FILE" 2>&1) || true
+
+# Fail hard on anything other than duplicate key / already-exists warnings
+FATAL_ERRORS=$(echo "$MIGRATION_OUTPUT" | grep -v "Duplicate key name" | grep -v "already exists" | grep "ERROR" || true)
+if [[ -n "$FATAL_ERRORS" ]]; then
+  echo "$MIGRATION_OUTPUT" >&2
+  error "Fatal migration error(s) detected. See output above."
+fi
+
+if echo "$MIGRATION_OUTPUT" | grep -q "Duplicate key name"; then
+  warn "Skipped duplicate index(es) - schema already up to date."
+fi
+
 ok "Migrations applied successfully."
 
 # ---------------------------------------------------------------------------
-# 4. Verify tables exist
+# 5. Verify tables exist
 # ---------------------------------------------------------------------------
 log "Verifying schema..."
 REQUIRED_TABLES=("tenants" "users" "review_cycles" "competencies" "rater_assignments" "survey_responses")
 MISSING=0
-
 for TABLE in "${REQUIRED_TABLES[@]}"; do
   COUNT=$(${MYSQL_CMD} "${DB_NAME}" -e \
     "SELECT COUNT(*) FROM information_schema.tables \
@@ -80,12 +121,11 @@ for TABLE in "${REQUIRED_TABLES[@]}"; do
     ok "  Table exists: $TABLE"
   fi
 done
-
 [[ "$MISSING" -eq 0 ]] || error "$MISSING table(s) missing after migration. Check migration SQL."
 ok "All ${#REQUIRED_TABLES[@]} tables verified."
 
 # ---------------------------------------------------------------------------
-# 5. Create application DB user with limited privileges (if root creds provided)
+# 6. Create application DB user with limited privileges (if root creds provided)
 # ---------------------------------------------------------------------------
 if [[ "${DB_USER}" == "root" ]] && [[ -n "${DB_APP_USER:-}" ]] && [[ -n "${DB_APP_PASSWORD:-}" ]]; then
   log "Creating application DB user '${DB_APP_USER}'..."
